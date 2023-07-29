@@ -1,0 +1,41 @@
+name: build sub-store-workers
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+    paths-ignore:
+      - 'README.md'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v3
+
+      - name: Install Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        id: pnpm-install
+        with:
+          version: latest
+          run_install: false
+
+      - name: Install and Deploy
+        env:
+          DATABASE_NAME: ${{ secrets.DATABASE_NAME }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          sed -i "s|substore_workers_database_name|$DATABASE_NAME|g" wrangler.toml
+          sed -i "s|substore_workers_database_id|$DATABASE_ID|g" wrangler.toml
+          pnpm install -g wrangler
+          pnpm install
+          CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler deploy > /dev/null
