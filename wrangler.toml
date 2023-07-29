@@ -1,0 +1,10 @@
+name = "sub-store-workers"
+compatibility_date = "2023-07-19"
+main = "src/index.ts"
+compatibility_flags = [ "nodejs_compat" ]
+minify = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "substore_workers_database_name"
+database_id = "substore_workers_database_id"

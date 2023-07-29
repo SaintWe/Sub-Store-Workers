@@ -1,0 +1,23 @@
+{
+  "name": "sub-store-workers",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "wrangler dev --log-level debug",
+    "deploy": "wrangler deploy",
+    "deploy_dry": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "hono": "^3.3.1",
+    "js-base64": "^3.7.5",
+    "kysely": "^0.26.1",
+    "kysely-d1": "^0.3.0",
+    "lodash": "^4.17.21",
+    "peggy": "^3.0.2",
+    "static-js-yaml": "^1.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20230628.0",
+    "wrangler": "^3.1.2"
+  }
+}
