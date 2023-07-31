@@ -1,5 +1,7 @@
 ## Sub-Store Workers 部署
 
+**版权声明：作者为 [Peng-YM](https://github.com/Peng-YM) 以及 [所有参与贡献的大佬们](https://github.com/sub-store-org/Sub-Store/graphs/contributors)，由本人修改适配 Cloudflare Workers**
+
 项目使用到 [Cloudflare Workers Serverless](https://workers.cloudflare.com/) 以及 [Cloudflare D1 Serverless SQL databases](https://developers.cloudflare.com/d1/)，感谢 Cloudflare
 
 ## 部署
@@ -97,3 +99,5 @@
 ## 结束语
 
 - 感谢 [@Peng-YM](https://github.com/Peng-YM/Sub-Store) 以及所有参与的大佬的无私的奉献
+
+
