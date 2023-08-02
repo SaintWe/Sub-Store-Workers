@@ -98,6 +98,7 @@
 
 ## 结束语
 
+- 感谢 [淮城一只猫 @JaxsonWang](https://github.com/JaxsonWang) 在移植过程中提供的帮助
 - 感谢 [@Peng-YM](https://github.com/Peng-YM/Sub-Store) 以及所有参与的大佬的无私的奉献
 
 
