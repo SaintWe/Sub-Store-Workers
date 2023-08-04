@@ -41,9 +41,11 @@
 
 重复上述步骤将以下 3 项依次添加
 
-- name 填入【 CLOUDFLARE_API_TOKEN 】secrets 填入第一步获取的令牌
-- name 填入【 DATABASE_ID 】secrets 填入第二步获取的数据库 ID
-- name 填入【 DATABASE_NAME 】secrets 填入第二步获取的数据库名称
+- name 填入【 `CLOUDFLARE_API_TOKEN` 】secrets 填入第一步获取的令牌
+- name 填入【 `DATABASE_ID` 】secrets 填入第二步获取的数据库 ID
+- name 填入【 `DATABASE_NAME` 】secrets 填入第二步获取的数据库名称
+- name 填入【 `BEARER_TOKEN` 】secrets 您随机生成一个大小写字母+数字的组合填入，为 HTTP Bearer Token，前后端通信认证使用
+- name 填入【 `D_TOKEN` 】secrets 您随机生成一个大小写字母+数字的组合填入，为您从 sub-store-workers 后端获取和预览节点的认证
 
 ### 0x5 启用 Actions
 
@@ -56,17 +58,6 @@
 您可以在此处获取到您的 sub-store-workers 地址也就是后端地址
 
 或您亦可自行绑定域名
-
-### 0x6 设置身份认证
-
-在 Workers 和 Pages 应用的设置中配置环境变量
-
-- `BEARER_TOKEN` 为 HTTP Bearer Token，前后端通信认证使用
-- `D_TOKEN` 为您从 sub-store-workers 后端获取和预览节点的认证
-
-若未配置上述环境变量，则任何人在得知后端地址的情况下均有权访问和编辑
-
-设置 **D_TOKEN** 后，前端会自动处理预览以及获取节点的认证，您不会有任何感知
 
 ## 前端
 
@@ -88,7 +79,7 @@
 
 ### 参数解析
 
-以下内容非必须，您可以全部使用，或使用部分：
+以下内容必须，您需全部使用：
 
 - `api_url` 或 `api` 为后端地址
 - `bearer_token` 或 `token` 为 HTTP Bearer Token，前后端通信认证使用
@@ -100,5 +91,3 @@
 
 - 感谢 [淮城一只猫 @JaxsonWang](https://github.com/JaxsonWang) 在移植过程中提供的帮助
 - 感谢 [@Peng-YM](https://github.com/Peng-YM/Sub-Store) 以及所有参与的大佬的无私的奉献
-
-

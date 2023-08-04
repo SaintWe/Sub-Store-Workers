@@ -8,3 +8,7 @@ minify = true
 binding = "DB"
 database_name = "substore_workers_database_name"
 database_id = "substore_workers_database_id"
+
+[vars]
+BEARER_TOKEN = "substore_workers_bearer_token"
+D_TOKEN = "substore_workers_d_token"
