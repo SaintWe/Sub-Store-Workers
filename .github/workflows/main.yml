@@ -33,9 +33,13 @@ jobs:
           DATABASE_NAME: ${{ secrets.DATABASE_NAME }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
+          D_TOKEN: ${{ secrets.D_TOKEN }}
         run: |
           sed -i "s|substore_workers_database_name|$DATABASE_NAME|g" wrangler.toml
           sed -i "s|substore_workers_database_id|$DATABASE_ID|g" wrangler.toml
+          sed -i "s|substore_workers_bearer_token|$BEARER_TOKEN|g" wrangler.toml
+          sed -i "s|substore_workers_d_token|$D_TOKEN|g" wrangler.toml
           pnpm install -g wrangler
           pnpm install
           CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler deploy > /dev/null
