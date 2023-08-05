@@ -39,7 +39,7 @@
 
 在您 Fork 后的仓库 -> Settings -> Secrets and variables -> Actions -> new repository secrets
 
-重复上述步骤将以下 3 项依次添加
+重复上述步骤将以下内容依次添加
 
 - name 填入【 `CLOUDFLARE_API_TOKEN` 】secrets 填入第一步获取的令牌
 - name 填入【 `DATABASE_ID` 】secrets 填入第二步获取的数据库 ID
@@ -55,16 +55,14 @@
 
 如不出意外的话，回到 [此页面](https://dash.cloudflare.com/) 进入 Workers 和 Pages 即可看到已创建的应用
 
-您可以在此处获取到您的 sub-store-workers 地址也就是后端地址
-
-或您亦可自行绑定域名
+您可以在此处获取到您的 sub-store-workers 地址也就是后端地址，workers.dev 的地址在大陆地区可能访问异常，推荐您自行绑定域名
 
 ## 前端
 
 - **Vercel**：<https://sub-store-workers.vercel.app>
 - **Cloudflare Pages**：<https://sub-store-workers.pages.dev>
 
-上述 2 个由我构建，推荐您审查代码然后使用 [SaintWe/Sub-Store-Front-End](https://github.com/SaintWe/Sub-Store-Front-End) 自行构建
+上述 2 个由我构建，但在大陆地区可能访问异常，推荐您审查代码然后使用 [SaintWe/Sub-Store-Front-End](https://github.com/SaintWe/Sub-Store-Front-End) 自行构建绑定自己的域名
 
 ### 前后端连接
 
@@ -73,13 +71,11 @@
 - https://sub-store-workers.vercel.app?api_url=https%3A%2F%2Fgithub.com&bearer_token=111222333444&d_token=555666777888
 - https://sub-store-workers.vercel.app?api=https%3A%2F%2Fgithub.com&token=111222333444&d_token=555666777888
 
-*您设置后端地址以及其他内容均保存在浏览器中，清理浏览器或导致您需重新填写*
+*您设置后端地址、Bearer Token 以及 D Token 均保存在浏览器中，清理浏览器或导致您需重新填写*
 
 *将 URL 保存为书签方便多设备使用*
 
 ### 参数解析
-
-以下内容必须，您需全部使用：
 
 - `api_url` 或 `api` 为后端地址
 - `bearer_token` 或 `token` 为 HTTP Bearer Token，前后端通信认证使用
