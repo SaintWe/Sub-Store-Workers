@@ -40,6 +40,6 @@ jobs:
           sed -i "s|substore_workers_database_id|$DATABASE_ID|g" wrangler.toml
           sed -i "s|substore_workers_bearer_token|$BEARER_TOKEN|g" wrangler.toml
           sed -i "s|substore_workers_d_token|$D_TOKEN|g" wrangler.toml
-          pnpm install -g wrangler
+          pnpm install -g wrangler@"^3.1.2"
           pnpm install
           CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler deploy > /dev/null
