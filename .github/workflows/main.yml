@@ -19,7 +19,9 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: 18
+          # 升级到 Node.js 20，以满足 Wrangler 4.x 的要求
+          node-version: 20
+          cache: 'pnpm'
 
       - name: Install pnpm
         uses: pnpm/action-setup@v2
@@ -36,10 +38,18 @@ jobs:
           BEARER_TOKEN: ${{ secrets.BEARER_TOKEN }}
           D_TOKEN: ${{ secrets.D_TOKEN }}
         run: |
+          # 替换 wrangler.toml 中的占位符
           sed -i "s|substore_workers_database_name|$DATABASE_NAME|g" wrangler.toml
           sed -i "s|substore_workers_database_id|$DATABASE_ID|g" wrangler.toml
           sed -i "s|substore_workers_bearer_token|$BEARER_TOKEN|g" wrangler.toml
           sed -i "s|substore_workers_d_token|$D_TOKEN|g" wrangler.toml
+          
+          # 安装依赖
           pnpm install -g wrangler
           pnpm install
-          CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler deploy > /dev/null
+          
+          # 批准构建脚本
+          pnpm approve-builds -g
+          
+          # 部署应用（移除了 > /dev/null，以便查看详细日志）
+          CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" wrangler deploy
