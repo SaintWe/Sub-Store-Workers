@@ -292,7 +292,7 @@ const tasks = {
                     const before = contents.slice(0, startIdx);
                     const chunk = contents.slice(startIdx, endIdx);
                     const after = contents.slice(endIdx);
-                    const requiredNeedles = ['tasks.has(id)', 'tasks.set(id, result)', 'const id = hex_md5('];
+                    const requiredNeedles = ['tasks.has(id)', 'tasks.set(id,', 'const id = hex_md5('];
                     const missing = requiredNeedles.filter((n) => !chunk.includes(n));
                     if (missing.length > 0) {
                         this.error(`[sub-store-transform] download.js 结构已变化，补丁未应用：缺少关键片段: ${missing.join(', ')}`);
@@ -307,6 +307,7 @@ const tasks = {
     awaitCustomCache,
     noCache,
     preprocess,
+    options = {},
 ) {
     let $arguments = {};
     try {
@@ -329,12 +330,19 @@ const tasks = {
     }
 
     if (noCache || ($arguments && $arguments.noCache)) {
-        return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess);
+        return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess, options);
+    }
+
+    let optionsKey = '';
+    try {
+        optionsKey = options && typeof options === 'object' ? JSON.stringify(options) : String(options ?? '');
+    } catch (e) {
+        optionsKey = '';
     }
 
     const context = globalThis.__substore_get_active_context__?.();
     const scope = context?.user?.id ?? context?.requestId ?? '';
-    const inflightKey = String(scope) + '::' + String(ua || '') + '::' + String(rawUrl) + '::' + (preprocess ? '1' : '0');
+    const inflightKey = String(scope) + '::' + String(ua || '') + '::' + String(rawUrl) + '::' + (preprocess ? '1' : '0') + '::' + optionsKey;
     if (!globalThis.__sub_store_workers_inflight_tasks__) {
         globalThis.__sub_store_workers_inflight_tasks__ = new Map();
     }
@@ -343,7 +351,7 @@ const tasks = {
     }
     const p = (async () => {
         try {
-            return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess);
+            return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess, options);
         } finally {
             globalThis.__sub_store_workers_inflight_tasks__.delete(inflightKey);
         }
