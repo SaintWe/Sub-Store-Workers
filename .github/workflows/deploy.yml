@@ -105,7 +105,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: latest
+          version: 11.11.0
 
       - name: Download Sub-Store Source Code
         env:
@@ -117,7 +117,7 @@ jobs:
           SUBSTORE_REPO='${{ env.SUBSTORE_REPO }}' \
           SUBSTORE_VERSION="$VERSION" \
           bash scripts/fetch-substore.sh
-          
+
           # 复制整个项目到构建目录（包含 sub-store/backend）
           mkdir -p build
           rsync -av --exclude='.git' --exclude='build' --exclude='node_modules' . build/
