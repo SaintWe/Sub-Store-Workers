@@ -129,10 +129,10 @@ export default function getParser() {
 
             if (id.includes('utils/cors.js')) {
                 contents = contents.replace(
-                    /NON_NODE_CORS_DEFAULT\s*=\s*['"].+['"]/,
-                    "NON_NODE_CORS_DEFAULT='*'",
+                    "'https://sub-store.vercel.app'",
+                    "'*'",
                 );
-                if (contents.includes("https://sub-store.vercel.app")) {
+                if (contents.includes("'https://sub-store.vercel.app'")) {
                     this.error('[sub-store-transform] cors.js CORS 默认值替换未生效');
                 }
             }
