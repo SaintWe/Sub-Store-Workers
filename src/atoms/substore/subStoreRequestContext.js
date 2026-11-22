@@ -145,7 +145,7 @@ export function installSubStoreContextGlobals() {
 
     globalThis.$done = (response) => {
         const ctx = getActiveSubStoreContext();
-        if (typeof ctx?.done === 'function') {
+        if (ctx && !ctx.aborted && typeof ctx.done === 'function') {
             ctx.done(response);
         }
     };
@@ -189,6 +189,14 @@ export function createSubStoreRequestContext({ requestId, request, user, env, pe
         dirty: false,
         userData: null,
         done: null,
+        // 超时取消标志：置位后，底层脚本的所有副作用出口（存储写入、通知、
+        // flush 落盘）全部被闸掉，避免超时后仍产生数据写入。
+        aborted: false,
+        // 取消执行：置位 aborted、摘掉 done 回调，使未完成的请求无法再回写结果。
+        cancel() {
+            this.aborted = true;
+            this.done = null;
+        },
     };
 }
 
@@ -201,6 +209,13 @@ export async function runWithSubStoreContext(subStoreContext, fn) {
 
 export function flushSubStoreRequestContext(subStoreContext) {
     if (!subStoreContext?.dirty || !subStoreContext.userData) return null;
+    // 已取消（超时）的请求不得落盘：底层脚本可能在超时后继续写入，
+    // 把这些写入持久化会污染用户数据。
+    if (subStoreContext.aborted) {
+        subStoreContext.dirty = false;
+        subStoreContext.userData = null;
+        return null;
+    }
     const dataString = JSON.stringify(subStoreContext.userData);
     subStoreContext.dirty = false;
     subStoreContext.userData = null;
