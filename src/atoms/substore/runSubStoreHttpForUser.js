@@ -155,7 +155,11 @@ async function executeSubStoreRequest({ $request, subStoreContext, requestId, ti
 
         timeoutId = setTimeout(() => {
             warn(`[SubStoreAtom] [${requestId}] ${timeoutLabel}`);
-            subStoreContext.done = null;
+            // 真正的执行生命周期管理，而不是仅提前返回 504：
+            // cancel() 置位 aborted、摘掉 done 回调，底层脚本（无法在 JS 层
+            // 强杀）的所有副作用出口——存储写入、通知、flush 落盘——全部被
+            // 闸掉，超时后不会继续产生数据写入。
+            subStoreContext.cancel();
             resolve({
                 result: {
                     status: 504,
@@ -179,7 +183,7 @@ function cleanupSubStoreAttempt(attemptId) {
     deleteSubStoreRequestContext(attemptId);
 }
 
-export async function runSubStoreHttpForUser({ user, env, state, request, subStorePath }) {
+export async function runSubStoreHttpForUser({ user, env, state, request, subStorePath, timeoutMs = 25000 }) {
     const ctx = {
         waitUntil: (p) => {
             if (state?.waitUntil) return state.waitUntil(p);
@@ -263,7 +267,7 @@ export async function runSubStoreHttpForUser({ user, env, state, request, subSto
         $request,
         subStoreContext,
         requestId,
-        timeoutMs: 25000,
+        timeoutMs,
         timeoutLabel: '请求超时',
     }));
 
