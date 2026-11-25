@@ -175,7 +175,9 @@ export async function runSubStoreCronForUser({ user, env }) {
             };
             timeoutId = setTimeout(() => {
                 warn(`[SubStoreAtom] [${requestId}] cron 超时`);
-                subStoreContext.done = null;
+                // 取消未完成的执行：置位 aborted、摘掉 done 回调，
+                // 超时后底层脚本的存储写入等副作用出口全部被闸掉。
+                subStoreContext.cancel();
                 resolve();
             }, 60000);
 
