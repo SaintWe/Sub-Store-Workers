@@ -300,111 +300,176 @@ async function runScriptOnce({
     const QuickJS = await getQuickJsModule();
 
     const runtime = QuickJS.newRuntime();
-    const vm = runtime.newContext();
 
-    const deadline = Date.now() + (limits.timeoutMs || DEFAULT_LIMITS.timeoutMs);
-    runtime.setMemoryLimit(limits.memoryLimitBytes || DEFAULT_LIMITS.memoryLimitBytes);
-    runtime.setMaxStackSize(limits.maxStackSizeBytes || DEFAULT_LIMITS.maxStackSizeBytes);
-    runtime.setInterruptHandler(() => Date.now() > deadline);
+    // 异常/超时路径下 VM 会被销毁；置位后，仍在执行中的 Host Call 回调
+    // 不再向 VM 回写结果（回写已销毁的 VM 会抛错）。
+    let aborted = false;
 
-    const executePendingJobs = () => {
-        const r = runtime.executePendingJobs();
-        // executePendingJobs may throw via unwrapResult if we want; here best-effort.
-        if (r && r.error) {
-            // dispose error handle to avoid leaking.
-            try {
-                r.error.dispose();
-            } catch {
-                // ignore
-            }
-        }
+    // 统一登记需要释放的 Handle：任何路径（成功 / 异常 / 超时）最终都由
+    // finally 无条件释放，避免反复触发异常或超时造成 WASM Runtime/Context 泄漏。
+    const handlesToDispose = [];
+    const track = (h) => {
+        if (h) handlesToDispose.push(h);
+        return h;
+    };
+    // QuickJSDeferredPromise 是自持生命周期对象：宿主 Promise 永不 settle 时，
+    // 必须显式 dispose deferred，否则 vm.dispose() 会触发 QuickJS GC 断言。
+    const deferredsToDispose = [];
+    const trackDeferred = (d) => {
+        deferredsToDispose.push(d);
+        return d;
     };
 
-    // Host-call bridge
-    const hostCallHandle = vm.newFunction('__hostCall', (pathHandle, argsHandle) => {
-        const path = vm.dump(pathHandle);
-        const args = vm.dump(argsHandle) || [];
+    // VM 创建与 Runtime 配置也可能抛错，必须一并纳入 try/finally，
+    // 否则这些路径上刚创建的 runtime 会泄漏。
+    let vm = null;
+    let out;
+    try {
+        vm = runtime.newContext();
 
-        const callable = resolveCallable(hostRoots, path);
-        if (typeof callable.fn !== 'function') {
-            throw new Error(`host api is not callable: ${String(path)}`);
+        const deadline = Date.now() + (limits.timeoutMs || DEFAULT_LIMITS.timeoutMs);
+        runtime.setMemoryLimit(limits.memoryLimitBytes || DEFAULT_LIMITS.memoryLimitBytes);
+        runtime.setMaxStackSize(limits.maxStackSizeBytes || DEFAULT_LIMITS.maxStackSizeBytes);
+        runtime.setInterruptHandler(() => Date.now() > deadline);
+
+        const executePendingJobs = () => {
+            // 已取消（异常/超时路径）时 Runtime 即将/已经销毁，不再触碰。
+            if (aborted) return;
+            const r = runtime.executePendingJobs();
+            // executePendingJobs may throw via unwrapResult if we want; here best-effort.
+            if (r && r.error) {
+                // dispose error handle to avoid leaking.
+                try {
+                    r.error.dispose();
+                } catch {
+                    // ignore
+                }
+            }
+        };
+
+        // Host-call bridge
+        const hostCallHandle = vm.newFunction('__hostCall', (pathHandle, argsHandle) => {
+            const path = vm.dump(pathHandle);
+            const args = vm.dump(argsHandle) || [];
+
+            const callable = resolveCallable(hostRoots, path);
+            if (typeof callable.fn !== 'function') {
+                throw new Error(`host api is not callable: ${String(path)}`);
+            }
+
+            let result;
+            try {
+                result = callable.fn.apply(callable.receiver, Array.isArray(args) ? args : [args]);
+            } catch (e) {
+                throw e;
+            }
+
+            if (isThenable(result)) {
+                const deferred = trackDeferred(vm.newPromise());
+                deferred.settled.then(executePendingJobs);
+
+                Promise.resolve(result)
+                    .then((value) => {
+                        if (aborted) return;
+                        const h = nativeToQuickJsHandle(vm, value);
+                        deferred.resolve(h);
+                        h.dispose();
+                    })
+                    .catch((err) => {
+                        if (aborted) return;
+                        const h = vm.newString(err?.message || String(err));
+                        deferred.reject(h);
+                        h.dispose();
+                    });
+
+                return deferred.handle;
+            }
+
+            return nativeToQuickJsHandle(vm, result);
+        });
+
+        // Expose hostCall to global
+        vm.setProp(vm.global, '__hostCall', hostCallHandle);
+        // Transfer ownership to the VM (the global now references it)
+        hostCallHandle.dispose();
+
+        // Install prelude (proxies + Buffer polyfill)
+        const preludeResult = vm.evalCode(buildPreludeSource());
+        if (preludeResult.error) {
+            const msg = vm.dump(preludeResult.error);
+            preludeResult.error.dispose();
+            throw new Error(`QuickJS prelude failed: ${msg}`);
         }
+        preludeResult.value.dispose();
 
-        let result;
-        try {
-            result = callable.fn.apply(callable.receiver, Array.isArray(args) ? args : [args]);
-        } catch (e) {
-            throw e;
-        }
+        // Build injected values
+        const envSnapshot = buildEnvSnapshot($substore);
 
-        if (isThenable(result)) {
-            const deferred = vm.newPromise();
-            deferred.settled.then(executePendingJobs);
+        const qjsArguments = track(nativeToQuickJsHandle(vm, $arguments || {}));
+        const qjsOptions = track(nativeToQuickJsHandle(vm, $options || {}));
 
-            Promise.resolve(result)
-                .then((value) => {
-                    const h = nativeToQuickJsHandle(vm, value);
-                    deferred.resolve(h);
-                    h.dispose();
-                })
-                .catch((err) => {
-                    const h = vm.newString(err?.message || String(err));
-                    deferred.reject(h);
-                    h.dispose();
+        // $substore object: env snapshot + selected methods mapped to host api
+        const qjsSubstore = track(vm.newObject());
+        const qjsEnv = nativeToQuickJsHandle(vm, envSnapshot);
+        vm.setProp(qjsSubstore, 'env', qjsEnv);
+        qjsEnv.dispose();
+
+        // $substore.http.* (very commonly used in Sub-Store scripts)
+        {
+            const qjsHttp = vm.newObject();
+            const methods = ['get', 'post', 'put', 'delete', 'head', 'options', 'patch'];
+            for (const method of methods) {
+                const fn = vm.newFunction(method, (optionsHandle) => {
+                    const options = vm.dump(optionsHandle);
+                    const callable = resolveCallable(hostRoots, `substore.http.${method}`);
+                    const res = callable.fn.apply(callable.receiver, [options]);
+                    if (isThenable(res)) {
+                        const deferred = trackDeferred(vm.newPromise());
+                        deferred.settled.then(executePendingJobs);
+                        Promise.resolve(res)
+                            .then((v) => {
+                                if (aborted) return;
+                                const hv = nativeToQuickJsHandle(vm, v);
+                                deferred.resolve(hv);
+                                hv.dispose();
+                            })
+                            .catch((err) => {
+                                if (aborted) return;
+                                const he = vm.newError(err?.message || String(err));
+                                deferred.reject(he);
+                                he.dispose();
+                            });
+                        return deferred.handle;
+                    }
+                    return nativeToQuickJsHandle(vm, res);
                 });
-
-            return deferred.handle;
+                vm.setProp(qjsHttp, method, fn);
+                fn.dispose();
+            }
+            vm.setProp(qjsSubstore, 'http', qjsHttp);
+            qjsHttp.dispose();
         }
 
-        return nativeToQuickJsHandle(vm, result);
-    });
-
-    // Expose hostCall to global
-    vm.setProp(vm.global, '__hostCall', hostCallHandle);
-    // Transfer ownership to the VM (the global now references it)
-    hostCallHandle.dispose();
-
-    // Install prelude (proxies + Buffer polyfill)
-    const preludeResult = vm.evalCode(buildPreludeSource());
-    if (preludeResult.error) {
-        const msg = vm.dump(preludeResult.error);
-        preludeResult.error.dispose();
-        throw new Error(`QuickJS prelude failed: ${msg}`);
-    }
-    preludeResult.value.dispose();
-
-    // Build injected values
-    const envSnapshot = buildEnvSnapshot($substore);
-
-    const qjsArguments = nativeToQuickJsHandle(vm, $arguments || {});
-    const qjsOptions = nativeToQuickJsHandle(vm, $options || {});
-
-    // $substore object: env snapshot + selected methods mapped to host api
-    const qjsSubstore = vm.newObject();
-    const qjsEnv = nativeToQuickJsHandle(vm, envSnapshot);
-    vm.setProp(qjsSubstore, 'env', qjsEnv);
-    qjsEnv.dispose();
-
-    // $substore.http.* (very commonly used in Sub-Store scripts)
-    {
-        const qjsHttp = vm.newObject();
-        const methods = ['get', 'post', 'put', 'delete', 'head', 'options', 'patch'];
-        for (const method of methods) {
-            const fn = vm.newFunction(method, (optionsHandle) => {
-                const options = vm.dump(optionsHandle);
-                const callable = resolveCallable(hostRoots, `substore.http.${method}`);
-                const res = callable.fn.apply(callable.receiver, [options]);
+        const substoreMethods = ['read', 'write', 'delete', 'log', 'info', 'error', 'notify', 'wait'];
+        for (const m of substoreMethods) {
+            const fn = vm.newFunction(m, (...args) => {
+                // Forward to hostRoots.substore[m]
+                const nativeArgs = args.map((h) => vm.dump(h));
+                const callable = resolveCallable(hostRoots, `substore.${m}`);
+                const res = callable.fn.apply(callable.receiver, nativeArgs);
                 if (isThenable(res)) {
-                    const deferred = vm.newPromise();
+                    const deferred = trackDeferred(vm.newPromise());
                     deferred.settled.then(executePendingJobs);
                     Promise.resolve(res)
                         .then((v) => {
+                            if (aborted) return;
                             const hv = nativeToQuickJsHandle(vm, v);
                             deferred.resolve(hv);
                             hv.dispose();
                         })
                         .catch((err) => {
-                            const he = vm.newError(err?.message || String(err));
+                            if (aborted) return;
+                            const he = vm.newString(err?.message || String(err));
                             deferred.reject(he);
                             he.dispose();
                         });
@@ -412,241 +477,243 @@ async function runScriptOnce({
                 }
                 return nativeToQuickJsHandle(vm, res);
             });
-            vm.setProp(qjsHttp, method, fn);
+            vm.setProp(qjsSubstore, m, fn);
             fn.dispose();
         }
-        vm.setProp(qjsSubstore, 'http', qjsHttp);
-        qjsHttp.dispose();
-    }
 
-    const substoreMethods = ['read', 'write', 'delete', 'log', 'info', 'error', 'notify', 'wait'];
-    for (const m of substoreMethods) {
-        const fn = vm.newFunction(m, (...args) => {
-            // Forward to hostRoots.substore[m]
-            const nativeArgs = args.map((h) => vm.dump(h));
-            const callable = resolveCallable(hostRoots, `substore.${m}`);
-            const res = callable.fn.apply(callable.receiver, nativeArgs);
-            if (isThenable(res)) {
-                const deferred = vm.newPromise();
-                deferred.settled.then(executePendingJobs);
-                Promise.resolve(res)
-                    .then((v) => {
-                        const hv = nativeToQuickJsHandle(vm, v);
-                        deferred.resolve(hv);
-                        hv.dispose();
-                    })
-                    .catch((err) => {
-                        const he = vm.newString(err?.message || String(err));
-                        deferred.reject(he);
-                        he.dispose();
-                    });
-                return deferred.handle;
-            }
-            return nativeToQuickJsHandle(vm, res);
-        });
-        vm.setProp(qjsSubstore, m, fn);
-        fn.dispose();
-    }
-
-    // Provide console.* for common scripts
-    {
-        const consoleObj = vm.newObject();
-        const levels = ['log', 'info', 'warn', 'error'];
-        for (const level of levels) {
-            const fn = vm.newFunction(level, (...args) => {
-                const nativeArgs = args.map((h) => vm.dump(h));
-                try {
-                    // Prefer Sub-Store logger if available
-                    const sub = hostRoots.substore;
-                    const target = typeof sub?.[level] === 'function' ? sub[level] : console[level] || console.log;
-                    if (typeof sub?.[level] === 'function') {
-                        target.apply(sub, nativeArgs);
-                    } else {
-                        target(...nativeArgs);
+        // Provide console.* for common scripts
+        {
+            const consoleObj = vm.newObject();
+            const levels = ['log', 'info', 'warn', 'error'];
+            for (const level of levels) {
+                const fn = vm.newFunction(level, (...args) => {
+                    const nativeArgs = args.map((h) => vm.dump(h));
+                    try {
+                        // Prefer Sub-Store logger if available
+                        const sub = hostRoots.substore;
+                        const target = typeof sub?.[level] === 'function' ? sub[level] : console[level] || console.log;
+                        if (typeof sub?.[level] === 'function') {
+                            target.apply(sub, nativeArgs);
+                        } else {
+                            target(...nativeArgs);
+                        }
+                    } catch {
+                        // ignore
                     }
-                } catch {
-                    // ignore
-                }
-                return vm.undefined;
-            });
-            vm.setProp(consoleObj, level, fn);
-            fn.dispose();
+                    return vm.undefined;
+                });
+                vm.setProp(consoleObj, level, fn);
+                fn.dispose();
+            }
+            vm.setProp(vm.global, 'console', consoleObj);
+            consoleObj.dispose();
         }
-        vm.setProp(vm.global, 'console', consoleObj);
-        consoleObj.dispose();
-    }
 
-    // Provide Surge-like $utils (geoip/ipasn/ipaso) to QuickJS scripts.
-    // These call back into the host's globalThis.$utils.
-    {
-        const utilsObj = vm.newObject();
-        const methods = ['geoip', 'ipasn', 'ipaso'];
-        for (const method of methods) {
-            const fn = vm.newFunction(method, (ipHandle) => {
-                const ip = vm.dump(ipHandle);
-                const callable = resolveCallable(hostRoots, `surgeUtils.${method}`);
-                if (typeof callable.fn !== 'function') return vm.undefined;
-                const res = callable.fn.apply(callable.receiver, [ip]);
-                return nativeToQuickJsHandle(vm, res);
-            });
-            vm.setProp(utilsObj, method, fn);
-            fn.dispose();
+        // Provide Surge-like $utils (geoip/ipasn/ipaso) to QuickJS scripts.
+        // These call back into the host's globalThis.$utils.
+        {
+            const utilsObj = vm.newObject();
+            const methods = ['geoip', 'ipasn', 'ipaso'];
+            for (const method of methods) {
+                const fn = vm.newFunction(method, (ipHandle) => {
+                    const ip = vm.dump(ipHandle);
+                    const callable = resolveCallable(hostRoots, `surgeUtils.${method}`);
+                    if (typeof callable.fn !== 'function') return vm.undefined;
+                    const res = callable.fn.apply(callable.receiver, [ip]);
+                    return nativeToQuickJsHandle(vm, res);
+                });
+                vm.setProp(utilsObj, method, fn);
+                fn.dispose();
+            }
+            vm.setProp(vm.global, '$utils', utilsObj);
+            utilsObj.dispose();
         }
-        vm.setProp(vm.global, '$utils', utilsObj);
-        utilsObj.dispose();
-    }
 
-    // Host proxies
-    const makeHostProxy = vm.getProp(vm.global, '__makeHostProxy__');
-    const BufferPolyfill = vm.getProp(vm.global, '__BufferPolyfill__');
+        // Host proxies
+        const makeHostProxy = track(vm.getProp(vm.global, '__makeHostProxy__'));
+        const BufferPolyfill = track(vm.getProp(vm.global, '__BufferPolyfill__'));
 
-    const mkProxy = (path) => {
-        const pathHandle = vm.newString(path);
-        const res = vm.callFunction(makeHostProxy, vm.undefined, pathHandle);
-        pathHandle.dispose();
-        return vm.unwrapResult(res);
-    };
+        const mkProxy = (path) => {
+            const pathHandle = vm.newString(path);
+            const res = vm.callFunction(makeHostProxy, vm.undefined, pathHandle);
+            pathHandle.dispose();
+            return vm.unwrapResult(res);
+        };
 
-    const lodashProxy = mkProxy('lodash');
-    const proxyUtilsProxy = mkProxy('ProxyUtils');
-    const yamlProxy = mkProxy('ProxyUtils.yaml');
-    const b64dProxy = mkProxy('ProxyUtils.Base64.decode');
-    const b64eProxy = mkProxy('ProxyUtils.Base64.encode');
-    const domainResolversProxy = mkProxy('DOMAIN_RESOLVERS');
-    const cacheProxy = mkProxy('scriptResourceCache');
-    const flowUtilsProxy = mkProxy('flowUtils');
-    const produceArtifactProxy = mkProxy('produceArtifact');
+        const lodashProxy = track(mkProxy('lodash'));
+        const proxyUtilsProxy = track(mkProxy('ProxyUtils'));
+        const yamlProxy = track(mkProxy('ProxyUtils.yaml'));
+        const b64dProxy = track(mkProxy('ProxyUtils.Base64.decode'));
+        const b64eProxy = track(mkProxy('ProxyUtils.Base64.encode'));
+        const domainResolversProxy = track(mkProxy('DOMAIN_RESOLVERS'));
+        const cacheProxy = track(mkProxy('scriptResourceCache'));
+        const flowUtilsProxy = track(mkProxy('flowUtils'));
+        const produceArtifactProxy = track(mkProxy('produceArtifact'));
 
-    // Wrapper that emulates upstream new Function signature
-    const wrapperSource = `
+        // Wrapper that emulates upstream new Function signature
+        const wrapperSource = `
 (function($arguments,$options,$substore,lodash,ProxyUtils,yaml,Buffer,b64d,b64e,DOMAIN_RESOLVERS,scriptResourceCache,flowUtils,produceArtifact,require){
 ${script}\n
 return ${name};
 })
 `;
 
-    const wrapperEval = vm.evalCode(wrapperSource);
-    if (wrapperEval.error) {
-        const msg = vm.dump(wrapperEval.error);
-        wrapperEval.error.dispose();
-        throw new Error(`QuickJS compile failed: ${msg}`);
-    }
-    const wrapperFn = wrapperEval.value;
+        const wrapperEval = vm.evalCode(wrapperSource);
+        if (wrapperEval.error) {
+            const msg = vm.dump(wrapperEval.error);
+            wrapperEval.error.dispose();
+            throw new Error(`QuickJS compile failed: ${msg}`);
+        }
+        const wrapperFn = track(wrapperEval.value);
 
-    const qjsRequire = vm.undefined;
+        const qjsRequire = vm.undefined;
 
-    const fnHandle = vm.unwrapResult(
-        vm.callFunction(
-            wrapperFn,
-            vm.undefined,
-            qjsArguments,
-            qjsOptions,
-            qjsSubstore,
-            lodashProxy,
-            proxyUtilsProxy,
-            yamlProxy,
-            BufferPolyfill,
-            b64dProxy,
-            b64eProxy,
-            domainResolversProxy,
-            cacheProxy,
-            flowUtilsProxy,
-            produceArtifactProxy,
-            qjsRequire,
-        ),
-    );
+        const fnHandle = track(
+            vm.unwrapResult(
+                vm.callFunction(
+                    wrapperFn,
+                    vm.undefined,
+                    qjsArguments,
+                    qjsOptions,
+                    qjsSubstore,
+                    lodashProxy,
+                    proxyUtilsProxy,
+                    yamlProxy,
+                    BufferPolyfill,
+                    b64dProxy,
+                    b64eProxy,
+                    domainResolversProxy,
+                    cacheProxy,
+                    flowUtilsProxy,
+                    produceArtifactProxy,
+                    qjsRequire,
+                ),
+            ),
+        );
 
-    const qjsCallArgs = callArgs.map((v) => nativeToQuickJsHandle(vm, v));
-    const callResult = vm.callFunction(fnHandle, vm.undefined, ...qjsCallArgs);
-
-    // dispose call args handles
-    for (const h of qjsCallArgs) h.dispose();
-
-    if (callResult.error) {
-        const msg = vm.dump(callResult.error);
-        callResult.error.dispose();
-        throw new Error(`QuickJS script threw: ${msg}`);
-    }
-
-    const resultHandle = callResult.value;
-
-    // Await promise by pumping pending jobs.
-    // In QuickJS, async functions queue pendingJobs and they do not run unless the host calls executePendingJobs().
-    // If we just await resolvePromise() without pumping jobs, even an immediately-resolving async function will hang.
-    let finalHandle = null;
-    let shouldDisposeFinal = false;
-    while (true) {
-        const state = vm.getPromiseState(resultHandle);
-        if (state.type === 'pending') {
-            if (Date.now() > deadline) {
-                throw new Error('QuickJS promise pending timeout');
+        const qjsCallArgs = [];
+        try {
+            for (const v of callArgs) {
+                qjsCallArgs.push(nativeToQuickJsHandle(vm, v));
             }
-            if (runtime.hasPendingJob()) {
-                const r = runtime.executePendingJobs();
-                if (r && r.error) {
-                    const msg = vm.dump(r.error);
-                    try {
-                        r.error.dispose();
-                    } catch {
-                        // ignore
-                    }
-                    throw new Error(`QuickJS executePendingJobs error: ${msg}`);
+        } catch (e) {
+            // 构造参数句柄中途失败时，先释放已创建的句柄再抛出。
+            for (const h of qjsCallArgs) {
+                try {
+                    h.dispose();
+                } catch {
+                    // ignore
                 }
+            }
+            throw e;
+        }
+
+        let callResult;
+        try {
+            callResult = vm.callFunction(fnHandle, vm.undefined, ...qjsCallArgs);
+        } finally {
+            for (const h of qjsCallArgs) {
+                try {
+                    h.dispose();
+                } catch {
+                    // ignore
+                }
+            }
+        }
+
+        if (callResult.error) {
+            const msg = vm.dump(callResult.error);
+            callResult.error.dispose();
+            throw new Error(`QuickJS script threw: ${msg}`);
+        }
+
+        const resultHandle = track(callResult.value);
+
+        // Await promise by pumping pending jobs.
+        // In QuickJS, async functions queue pendingJobs and they do not run unless the host calls executePendingJobs().
+        // If we just await resolvePromise() without pumping jobs, even an immediately-resolving async function will hang.
+        let finalHandle = null;
+        let shouldDisposeFinal = false;
+        while (true) {
+            const state = vm.getPromiseState(resultHandle);
+            if (state.type === 'pending') {
+                if (Date.now() > deadline) {
+                    throw new Error('QuickJS promise pending timeout');
+                }
+                if (runtime.hasPendingJob()) {
+                    const r = runtime.executePendingJobs();
+                    if (r && r.error) {
+                        const msg = vm.dump(r.error);
+                        try {
+                            r.error.dispose();
+                        } catch {
+                            // ignore
+                        }
+                        throw new Error(`QuickJS executePendingJobs error: ${msg}`);
+                    }
+                    continue;
+                }
+                // No pending jobs: yield to host event loop so that any host-side promises can resolve.
+                await new Promise((resolve) => setTimeout(resolve, 0));
                 continue;
             }
-            // No pending jobs: yield to host event loop so that any host-side promises can resolve.
-            await new Promise((resolve) => setTimeout(resolve, 0));
-            continue;
+
+            if (state.type === 'rejected') {
+                const msg = vm.dump(state.error);
+                state.error.dispose();
+                throw new Error(`QuickJS promise rejected: ${msg}`);
+            }
+
+            // fulfilled
+            if (state.notAPromise || state.value === resultHandle) {
+                finalHandle = resultHandle;
+                shouldDisposeFinal = false;
+            } else {
+                finalHandle = state.value;
+                shouldDisposeFinal = true;
+            }
+            break;
         }
 
-        if (state.type === 'rejected') {
-            const msg = vm.dump(state.error);
-            state.error.dispose();
-            throw new Error(`QuickJS promise rejected: ${msg}`);
-        }
+        // dump 必须在任何 Handle 释放之前完成。
+        out = vm.dump(finalHandle);
 
-        // fulfilled
-        if (state.notAPromise || state.value === resultHandle) {
-            finalHandle = resultHandle;
-            shouldDisposeFinal = false;
-        } else {
-            finalHandle = state.value;
-            shouldDisposeFinal = true;
+        if (shouldDisposeFinal && finalHandle && finalHandle !== resultHandle) {
+            track(finalHandle);
         }
-        break;
+    } finally {
+        // 统一释放：无论成功、异常还是超时，都无条件释放所有登记的 Handle、
+        // VM Context 与 WASM Runtime。
+        aborted = true;
+        for (const d of deferredsToDispose) {
+            try {
+                d.dispose();
+            } catch {
+                // best-effort cleanup
+            }
+        }
+        deferredsToDispose.length = 0;
+        for (const h of handlesToDispose) {
+            try {
+                h.dispose();
+            } catch {
+                // best-effort cleanup; vm.dispose() will still assert on leaks.
+            }
+        }
+        handlesToDispose.length = 0;
+        if (vm) {
+            try {
+                vm.dispose();
+            } catch (e) {
+                warn('[QuickJS] vm.dispose error:', e?.message || e);
+            }
+        }
+        try {
+            runtime.dispose();
+        } catch (e) {
+            warn('[QuickJS] runtime.dispose error:', e?.message || e);
+        }
     }
-
-    const out = vm.dump(finalHandle);
-
-    // Cleanup handles
-    try {
-        if (shouldDisposeFinal && finalHandle) finalHandle.dispose();
-        resultHandle.dispose();
-        fnHandle.dispose();
-        wrapperFn.dispose();
-
-        qjsArguments.dispose();
-        qjsOptions.dispose();
-        qjsSubstore.dispose();
-
-        lodashProxy.dispose();
-        proxyUtilsProxy.dispose();
-        yamlProxy.dispose();
-        b64dProxy.dispose();
-        b64eProxy.dispose();
-        domainResolversProxy.dispose();
-        cacheProxy.dispose();
-        flowUtilsProxy.dispose();
-        produceArtifactProxy.dispose();
-        makeHostProxy.dispose();
-        BufferPolyfill.dispose();
-    } catch (e) {
-        // best-effort cleanup; vm.dispose() will still assert on leaks.
-        warn('[QuickJS] cleanup error:', e?.message || e);
-    }
-
-    vm.dispose();
-    runtime.dispose();
 
     return out;
 }
