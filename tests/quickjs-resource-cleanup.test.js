@@ -30,11 +30,15 @@ const QJS_DEPS_DIR = process.env.QJS_DEPS_DIR || '';
 // 泄漏 = 有 runtime 永远 alive。
 const createdRuntimes = [];
 
-async function setupQuickJsLoader() {
+async function setupQuickJsLoader(limits) {
     if (!QJS_DEPS_DIR) {
         throw new Error('QJS_DEPS_DIR not set; install quickjs-emscripten first');
     }
-    if (globalThis.__loadQuickJsModule__) return globalThis.__loadQuickJsModule__();
+    if (globalThis.__loadQuickJsModule__) {
+        const { ensureSubStoreQuickJsScriptEngineInstalled } = await import('../src/adapters/quickjs/substore-script-engine.js');
+        ensureSubStoreQuickJsScriptEngineInstalled(limits);
+        return globalThis.__loadQuickJsModule__();
+    }
 
     const pkgDir = path.resolve(QJS_DEPS_DIR);
     assert.ok(existsSync(path.join(pkgDir, 'node_modules', 'quickjs-emscripten')), 'quickjs-emscripten not installed');
@@ -56,6 +60,8 @@ async function setupQuickJsLoader() {
     };
 
     globalThis.__loadQuickJsModule__ = async () => QuickJS;
+    const { ensureSubStoreQuickJsScriptEngineInstalled } = await import('../src/adapters/quickjs/substore-script-engine.js');
+    ensureSubStoreQuickJsScriptEngineInstalled(limits);
     return QuickJS;
 }
 
@@ -69,26 +75,26 @@ after(() => {
     );
 });
 
-async function getEngine() {
-    const { ensureSubStoreQuickJsScriptEngineInstalled } = await import('../src/adapters/quickjs/substore-script-engine.js');
-    ensureSubStoreQuickJsScriptEngineInstalled();
-    return globalThis.__substore_workers_createDynamicFunction__;
-}
-
 function makeCallContext() {
     return {
         requestId: 'qjs-test',
     };
 }
 
-async function makeRunner(script) {
-    const create = await getEngine();
+async function makeRunner(script, { substore, limits } = {}) {
+    const { ensureSubStoreQuickJsScriptEngineInstalled } = await import('../src/adapters/quickjs/substore-script-engine.js');
+    if (limits) {
+        // 引擎是模块级单例，默认只安装一次；测试短超时时必须强制重建。
+        delete globalThis.__substore_workers_createDynamicFunction__;
+        ensureSubStoreQuickJsScriptEngineInstalled(limits);
+    }
+    const create = globalThis.__substore_workers_createDynamicFunction__;
     return create({
         name: 'operator',
         script,
         $arguments: {},
         $options: {},
-        $substore: { env: {} },
+        $substore: { env: {}, ...(substore || {}) },
         lodash: {},
         ProxyUtils: {},
         DOMAIN_RESOLVERS: {},
@@ -143,4 +149,45 @@ test('QuickJS：反复失败后紧跟成功执行，无状态污染（泄漏会�
     const goodRunner = await makeRunner('async function operator(input) { return { count: (input && input.length) || 0 }; }');
     const out = await goodRunner([1, 2, 3], 'target', makeCallContext());
     assert.deepEqual(out, { count: 3 });
+});
+
+test('QuickJS：pending timeout 反复触发不泄漏 Runtime（短 timeoutMs）', async () => {
+    // 引擎在首次 setup 时已安装，这里把 timeoutMs 调到 200ms，
+    // 让一个永不 settle 的 host Promise 走到 "QuickJS promise pending timeout"。
+    const runner = await makeRunner(
+        'async function operator(input) { await new Promise(resolve => { globalThis.__hold = resolve; }); return 1; }',
+        { limits: { timeoutMs: 200 } },
+    );
+
+    for (let i = 0; i < 5; i++) {
+        await assert.rejects(
+            () => runner([], 'target', makeCallContext()),
+            /QuickJS promise pending timeout/,
+        );
+    }
+});
+
+test('QuickJS：取消后的 pending host 回调不再触碰 Runtime（无 abort 断言）', async () => {
+    await setupQuickJsLoader();
+    let resolveHost;
+    const hostPromise = new Promise((resolve) => {
+        resolveHost = resolve;
+    });
+    const before = createdRuntimes.length;
+    const runner = await makeRunner(
+        'async function operator(input) { return await $substore.log("x"); }',
+        { substore: { log: () => hostPromise }, limits: { timeoutMs: 150 } },
+    );
+
+    await assert.rejects(
+        () => runner([], 'target', makeCallContext()),
+        /QuickJS promise pending timeout/,
+    );
+    const created = createdRuntimes.slice(before);
+    assert.equal(created.length, 1);
+    assert.equal(created[0].alive, false, 'pending timeout 后 runtime 必须已释放');
+    // 超时后才 resolve host promise：此时 deferred.settled 会回调 executePendingJobs，
+    // aborted 闸必须挡住对已释放 Runtime 的触碰；否则 QuickJS WASM 会 abort。
+    resolveHost('late');
+    await new Promise((resolve) => setTimeout(resolve, 50));
 });

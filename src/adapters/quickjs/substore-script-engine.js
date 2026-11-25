@@ -300,7 +300,6 @@ async function runScriptOnce({
     const QuickJS = await getQuickJsModule();
 
     const runtime = QuickJS.newRuntime();
-    const vm = runtime.newContext();
 
     // 异常/超时路径下 VM 会被销毁；置位后，仍在执行中的 Host Call 回调
     // 不再向 VM 回写结果（回写已销毁的 VM 会抛错）。
@@ -313,29 +312,41 @@ async function runScriptOnce({
         if (h) handlesToDispose.push(h);
         return h;
     };
-
-    const deadline = Date.now() + (limits.timeoutMs || DEFAULT_LIMITS.timeoutMs);
-    runtime.setMemoryLimit(limits.memoryLimitBytes || DEFAULT_LIMITS.memoryLimitBytes);
-    runtime.setMaxStackSize(limits.maxStackSizeBytes || DEFAULT_LIMITS.maxStackSizeBytes);
-    runtime.setInterruptHandler(() => Date.now() > deadline);
-
-    const executePendingJobs = () => {
-        // 已取消（异常/超时路径）时 Runtime 即将/已经销毁，不再触碰。
-        if (aborted) return;
-        const r = runtime.executePendingJobs();
-        // executePendingJobs may throw via unwrapResult if we want; here best-effort.
-        if (r && r.error) {
-            // dispose error handle to avoid leaking.
-            try {
-                r.error.dispose();
-            } catch {
-                // ignore
-            }
-        }
+    // QuickJSDeferredPromise 是自持生命周期对象：宿主 Promise 永不 settle 时，
+    // 必须显式 dispose deferred，否则 vm.dispose() 会触发 QuickJS GC 断言。
+    const deferredsToDispose = [];
+    const trackDeferred = (d) => {
+        deferredsToDispose.push(d);
+        return d;
     };
 
+    // VM 创建与 Runtime 配置也可能抛错，必须一并纳入 try/finally，
+    // 否则这些路径上刚创建的 runtime 会泄漏。
+    let vm = null;
     let out;
     try {
+        vm = runtime.newContext();
+
+        const deadline = Date.now() + (limits.timeoutMs || DEFAULT_LIMITS.timeoutMs);
+        runtime.setMemoryLimit(limits.memoryLimitBytes || DEFAULT_LIMITS.memoryLimitBytes);
+        runtime.setMaxStackSize(limits.maxStackSizeBytes || DEFAULT_LIMITS.maxStackSizeBytes);
+        runtime.setInterruptHandler(() => Date.now() > deadline);
+
+        const executePendingJobs = () => {
+            // 已取消（异常/超时路径）时 Runtime 即将/已经销毁，不再触碰。
+            if (aborted) return;
+            const r = runtime.executePendingJobs();
+            // executePendingJobs may throw via unwrapResult if we want; here best-effort.
+            if (r && r.error) {
+                // dispose error handle to avoid leaking.
+                try {
+                    r.error.dispose();
+                } catch {
+                    // ignore
+                }
+            }
+        };
+
         // Host-call bridge
         const hostCallHandle = vm.newFunction('__hostCall', (pathHandle, argsHandle) => {
             const path = vm.dump(pathHandle);
@@ -354,7 +365,7 @@ async function runScriptOnce({
             }
 
             if (isThenable(result)) {
-                const deferred = vm.newPromise();
+                const deferred = trackDeferred(vm.newPromise());
                 deferred.settled.then(executePendingJobs);
 
                 Promise.resolve(result)
@@ -413,7 +424,7 @@ async function runScriptOnce({
                     const callable = resolveCallable(hostRoots, `substore.http.${method}`);
                     const res = callable.fn.apply(callable.receiver, [options]);
                     if (isThenable(res)) {
-                        const deferred = vm.newPromise();
+                        const deferred = trackDeferred(vm.newPromise());
                         deferred.settled.then(executePendingJobs);
                         Promise.resolve(res)
                             .then((v) => {
@@ -447,7 +458,7 @@ async function runScriptOnce({
                 const callable = resolveCallable(hostRoots, `substore.${m}`);
                 const res = callable.fn.apply(callable.receiver, nativeArgs);
                 if (isThenable(res)) {
-                    const deferred = vm.newPromise();
+                    const deferred = trackDeferred(vm.newPromise());
                     deferred.settled.then(executePendingJobs);
                     Promise.resolve(res)
                         .then((v) => {
@@ -674,6 +685,14 @@ return ${name};
         // 统一释放：无论成功、异常还是超时，都无条件释放所有登记的 Handle、
         // VM Context 与 WASM Runtime。
         aborted = true;
+        for (const d of deferredsToDispose) {
+            try {
+                d.dispose();
+            } catch {
+                // best-effort cleanup
+            }
+        }
+        deferredsToDispose.length = 0;
         for (const h of handlesToDispose) {
             try {
                 h.dispose();
@@ -682,10 +701,12 @@ return ${name};
             }
         }
         handlesToDispose.length = 0;
-        try {
-            vm.dispose();
-        } catch (e) {
-            warn('[QuickJS] vm.dispose error:', e?.message || e);
+        if (vm) {
+            try {
+                vm.dispose();
+            } catch (e) {
+                warn('[QuickJS] vm.dispose error:', e?.message || e);
+            }
         }
         try {
             runtime.dispose();
