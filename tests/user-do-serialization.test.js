@@ -19,7 +19,10 @@ function createStorageMock({ userData = null, store = {} } = {}) {
     // tagged template 的真形态：tagFn(strings, ...values)，
     // 插值参数是 strings 之后的独立参数。
     const sql = (strings, ...values) => {
-        const sqlText = String(strings[0]);
+        // tagged template 的真形态：tagFn(strings, ...values)，插值把 strings
+        // 切成多段。真实 SQL 是跨行模板，必须 join 全部片段才能匹配到
+        // "SELECT value ... FROM user_store"（value 与 FROM 分处两行）。
+        const sqlText = strings.join('?');
         ops.push({ type: 'sql', sql: sqlText, args: values });
         // 模拟 user_store 表
         if (/INSERT OR REPLACE INTO user_store/i.test(sqlText)) {
@@ -29,7 +32,7 @@ function createStorageMock({ userData = null, store = {} } = {}) {
             store[key] = value;
             return [];
         }
-        if (/SELECT value FROM user_store/i.test(sqlText)) {
+        if (/SELECT value\s+FROM user_store/i.test(sqlText)) {
             const key = values[0];
             const value = key === 'user_data' ? userData : store[key] ?? null;
             return [{ value }];
@@ -111,6 +114,94 @@ test('UserDO：并发请求的存储操作序列严格串行，不交错', async
     // 最终数据 = 后写入者（串行下这是确定行为）。
     const finalData = JSON.parse(storage.getUserData() || '{}');
     assert.ok('A' in finalData || 'B' in finalData);
+});
+
+function createDownloadRequest(userId, name) {
+    return {
+        url: `https://user/download/${name}`,
+        method: 'GET',
+        headers: {
+            get: (key) => {
+                const k = String(key).toLowerCase();
+                if (k === 'x-user-id') return String(userId);
+                if (k === 'user-agent') return 'test-agent';
+                return null;
+            },
+            forEach: () => {},
+        },
+        async text() {
+            return '';
+        },
+    };
+}
+
+// 真实的丢更新场景：一次 Sub-Store 下载请求内部读取整份 user_data、
+// await 脚本执行、最后整份写回。两个请求若交错执行，后写者会覆盖前者。
+// 用全局 dispatch stub 模拟这个「读 → await → 写 → $done」流程。
+async function withConcurrentSubStoreDownloads(t, run) {
+    const prevLoader = globalThis.__loadSubStoreEntry__;
+    const prevDispatch = globalThis.__substore_dispatch__;
+    globalThis.__loadSubStoreEntry__ = async () => {};
+    globalThis.__substore_dispatch__ = (request) => {
+        const name = new URL(request.url).pathname.split('/').pop();
+        const before = JSON.parse(globalThis.$persistentStore?.read('sub-store') || '{}');
+        // 模拟脚本 await：读完之后延迟写回。串行时第二个请求此时还没开始，
+        // 不串行时两个请求会在同一窗口内读到同一份旧数据。
+        Promise.resolve()
+            .then(() => new Promise((resolve) => setTimeout(resolve, 20)))
+            .then(() => {
+                globalThis.$persistentStore?.write(JSON.stringify({ ...before, [name]: 1 }), 'sub-store');
+                globalThis.$done?.({ status: 200, body: 'ok' });
+            })
+            .catch((e) => t.diagnostic(`dispatch error: ${e?.message || e}`));
+    };
+    try {
+        await run();
+    } finally {
+        if (prevLoader === undefined) delete globalThis.__loadSubStoreEntry__;
+        else globalThis.__loadSubStoreEntry__ = prevLoader;
+        if (prevDispatch === undefined) delete globalThis.__substore_dispatch__;
+        else globalThis.__substore_dispatch__ = prevDispatch;
+    }
+}
+
+test('UserDO：真并发 Sub-Store 请求（读 → await → 写）不丢更新', async (t) => {
+    // 与真实漏洞同形：每个下载请求读取 user_data['sub-store']，
+    // 脚本 await 期间若另一个请求也读到同一份数据，后写者会覆盖前者。
+    const storage = createStorageMock({ userData: JSON.stringify({ 'sub-store': '{"seed":1}' }) });
+    const userDO = new UserDO({ storage }, createEnvMock());
+
+    await withConcurrentSubStoreDownloads(t, async () => {
+        const [a, b] = await Promise.all([
+            userDO.fetch(createDownloadRequest(7, 'A')),
+            userDO.fetch(createDownloadRequest(7, 'B')),
+        ]);
+        assert.equal(a.status, 200);
+        assert.equal(b.status, 200);
+    });
+
+    const finalData = JSON.parse(JSON.parse(storage.getUserData())['sub-store']);
+    assert.equal(finalData.seed, 1, '初始字段保留');
+    assert.equal(finalData.A, 1, '请求 A 的更新保留');
+    assert.equal(finalData.B, 1, '请求 B 的更新保留（未丢更新）');
+});
+
+test('UserDO：无队列对照 — 同样的并发 Sub-Store 请求会丢更新', async (t) => {
+    const storage = createStorageMock({ userData: JSON.stringify({ 'sub-store': '{"seed":1}' }) });
+    const userDO = new UserDO({ storage }, createEnvMock());
+
+    // 用 _handleFetch 绕过 fetch 的串行队列，证明这个测试确实能抓到丢更新。
+    await withConcurrentSubStoreDownloads(t, async () => {
+        const [a, b] = await Promise.all([
+            userDO._handleFetch(createDownloadRequest(7, 'A')),
+            userDO._handleFetch(createDownloadRequest(7, 'B')),
+        ]);
+        assert.equal(a.status, 200);
+        assert.equal(b.status, 200);
+    });
+
+    const finalData = JSON.parse(JSON.parse(storage.getUserData())['sub-store']);
+    assert.ok(!(finalData.A && finalData.B), '对照：无队列时两个请求读到同一份旧数据，后写者覆盖前者');
 });
 
 test('UserDO：请求失败不会卡死串行队列，后续请求仍能执行', async () => {
