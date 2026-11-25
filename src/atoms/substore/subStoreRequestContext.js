@@ -152,7 +152,9 @@ export function installSubStoreContextGlobals() {
 
     globalThis.$notification = {
         post(...args) {
-            return getActiveSubStoreContext()?.notification?.post?.(...args);
+            const ctx = getActiveSubStoreContext();
+            if (ctx?.aborted) return;
+            return ctx?.notification?.post?.(...args);
         },
     };
 

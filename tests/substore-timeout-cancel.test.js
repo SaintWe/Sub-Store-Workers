@@ -93,6 +93,25 @@ test('正常完成（未取消）的请求 flush 照常落盘', async () => {
     assert.equal(ctx.dirty, false);
 });
 
+test('$notification.post 在取消后不再触发通道（通知副作用闸）', async () => {
+    const { ctx } = createContext();
+    let posted = 0;
+    ctx.notification = {
+        post: () => {
+            posted += 1;
+        },
+    };
+
+    await runWithSubStoreContext(ctx, async () => {
+        // 安装 $notification 全局（runWithSubStoreContext 内会装）
+        globalThis.$notification.post('before');
+        ctx.cancel();
+        globalThis.$notification.post('after');
+    });
+
+    assert.equal(posted, 1, '取消后不得再发通知');
+});
+
 test('runSubStoreHttpForUser 超时分支：真实走一遍 504 + cancel + 拒绝落盘', async () => {
     // 挂住的 dispatch（永不调用 done）→ 超时 → 504 → aborted → flush 拒绝落盘。
     const { runSubStoreHttpForUser } = await import('../src/atoms/substore/runSubStoreHttpForUser.js');
@@ -102,21 +121,17 @@ test('runSubStoreHttpForUser 超时分支：真实走一遍 504 + cancel + 拒�
     globalThis.__loadSubStoreEntry__ = async () => {};
     let dispatchCalled = false;
     let lateWriteDone = false;
+    let resolveLateWrite;
+    const lateWriteScheduled = new Promise((resolve) => {
+        resolveLateWrite = resolve;
+    });
     globalThis.__substore_dispatch__ = () => {
         dispatchCalled = true;
-        // 模拟底层脚本：写入存储（dirty 置位）但永不调用 $done —— 挂住到超时。
-        // 超时分支取消后，这次写入不得被 flush 落盘。
-        setTimeout(() => {
-            try {
-                globalThis.$persistentStore?.write(JSON.stringify({ 'sub-store': { late: 'write' } }));
-                lateWriteDone = true;
-            } catch {
-                // 上下文可能已拆除
-            }
-        }, 10);
+        // 模拟底层脚本永不调用 $done —— 挂住到超时。
+        // 超时返回 504 后再触发写入，验证写入确实发生在取消之后。
+        resolveLateWrite();
     };
 
-    const writes = [];
     const user = { id: 1, username: 'u', role: 'user', path: '', data: '{}' };
     const savedBlobs = [];
     const env = {
@@ -144,6 +159,15 @@ test('runSubStoreHttpForUser 超时分支：真实走一遍 504 + cancel + 拒�
 
     assert.equal(resp.status, 504, '挂住的请求应超时返回 504');
     assert.equal(dispatchCalled, true, '底层 dispatch 已被调用（模拟执行中）');
+    await lateWriteScheduled;
+
+    // 504 已经返回，现在才让底层脚本写入 —— 确凿地发生在取消之后。
+    // $persistentStore.write 本身不检查 aborted，这里写入内存 storage；
+    // 关键是 flush 必须拒绝把这份晚到数据持久化。
+    globalThis.$persistentStore?.write(JSON.stringify({ 'sub-store': { late: 'write' } }));
+    lateWriteDone = true;
+    await new Promise((resolve) => setTimeout(resolve, 10)); // 等 __saveUserData 完成
+
     assert.equal(lateWriteDone, true, '底层脚本的超时后写入已发生（模拟真实交错）');
     // dataString=null 时 __saveUserData 仍会被调用（其内部对 null 有 if (!saved) return 保护），
     // 但不得带出任何非空数据。
