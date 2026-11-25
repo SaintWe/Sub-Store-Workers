@@ -47,6 +47,9 @@ jobs:
       - name: Install backend dependencies
         run: pnpm run install:backend
 
+      - name: Run unit tests
+        run: QJS_DEPS_DIR=$GITHUB_WORKSPACE node --import ./tests/hooks/register.mjs --test tests/*.test.js
+
       - name: Configure wrangler.toml
         run: |
           cp wrangler.toml.example wrangler.toml
